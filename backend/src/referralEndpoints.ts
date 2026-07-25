@@ -3,6 +3,7 @@ import { referralService } from './referralService';
 import { logger } from './middleware/structuredLogging';
 import { normalizeWalletAddress } from './walletUtils';
 import { cacheMiddleware } from './middleware/cache';
+import { sendUpstreamErrorResponse } from './middleware/upstreamErrorBoundary';
 
 const router = Router();
 const REFERRAL_CACHE_TTL_MS = parseInt(process.env.CACHE_LIST_ENDPOINTS_TTL_MS || '30000', 10);
@@ -65,6 +66,9 @@ router.get('/:wallet', cacheMiddleware({ ttl: REFERRAL_CACHE_TTL_MS }), async (r
       error: error instanceof Error ? error.message : String(error),
       wallet: normalizedWallet,
     });
+    if (sendUpstreamErrorResponse(res, req, error, 'Failed to fetch referral stats')) {
+      return;
+    }
     return res.status(500).json({
       error: 'Internal Server Error',
       status: 500,
@@ -119,6 +123,9 @@ router.get('/code/:wallet', cacheMiddleware({ ttl: REFERRAL_CACHE_TTL_MS }), asy
       error: error instanceof Error ? error.message : String(error),
       wallet: normalizedWallet,
     });
+    if (sendUpstreamErrorResponse(res, req, error, 'Failed to get referral code')) {
+      return;
+    }
     return res.status(500).json({
       error: 'Internal Server Error',
       status: 500,

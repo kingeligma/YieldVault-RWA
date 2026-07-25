@@ -88,6 +88,7 @@ export interface WebhookDeadLetterRecord {
 }
 
 const deadLetters: WebhookDeadLetterRecord[] = [];
+const webhookReplayCache = new Map<string, number>();
 
 interface RegisterWebhookInput {
   url: string;
@@ -115,6 +116,7 @@ const jitterMaxMs = parseInt(process.env.WEBHOOK_JITTER_MAX_MS || '30000', 10);
 
 const verificationTimeoutMs = parseInt(process.env.WEBHOOK_VERIFICATION_TIMEOUT_MS || '5000', 10);
 const challengeTtlMs = parseInt(process.env.WEBHOOK_CHALLENGE_TTL_SECONDS || '900', 10) * 1000;
+const webhookSignatureMaxSkewMs = parseInt(process.env.WEBHOOK_SIGNATURE_MAX_SKEW_MS || '300000', 10);
 const isUnverifiedDeliveryAllowed = (): boolean => {
   if (process.env.WEBHOOK_ALLOW_UNVERIFIED !== undefined) {
     return process.env.WEBHOOK_ALLOW_UNVERIFIED === 'true';
@@ -409,6 +411,7 @@ export function resetWebhookState(): void {
   endpoints.clear();
   deliveries.length = 0;
   deadLetters.length = 0;
+  webhookReplayCache.clear();
   persistenceInitialized = false;
   delete process.env.WEBHOOK_ALLOW_UNVERIFIED;
   void clearPersistedWebhookEndpoints();
@@ -517,6 +520,59 @@ export function createWebhookSignature(secret: string, payload: unknown): string
     .digest('hex');
 }
 
+export interface WebhookSignedEnvelope {
+  eventType: TransactionEventType;
+  sentAt: string;
+  payload: TransactionEventPayload;
+  deliveryId: string;
+}
+
+function createReplayCacheKey(endpointId: string, deliveryId: string): string {
+  return `${endpointId}:${deliveryId}`;
+}
+
+function pruneWebhookReplayCache(now = Date.now()): void {
+  for (const [key, expiry] of webhookReplayCache.entries()) {
+    if (expiry <= now) {
+      webhookReplayCache.delete(key);
+    }
+  }
+}
+
+export function markWebhookDeliverySeen(endpointId: string, deliveryId: string, sentAt: string): boolean {
+  pruneWebhookReplayCache();
+
+  const sentAtMs = Date.parse(sentAt);
+  if (Number.isNaN(sentAtMs)) {
+    return false;
+  }
+
+  const now = Date.now();
+  if (Math.abs(now - sentAtMs) > webhookSignatureMaxSkewMs) {
+    return false;
+  }
+
+  const cacheKey = createReplayCacheKey(endpointId, deliveryId);
+  if (webhookReplayCache.has(cacheKey)) {
+    return false;
+  }
+
+  webhookReplayCache.set(cacheKey, sentAtMs + webhookSignatureMaxSkewMs);
+  return true;
+}
+
+export function buildWebhookSignedEnvelope(
+  delivery: WebhookDeliveryRecord,
+  payload: TransactionEventPayload,
+): WebhookSignedEnvelope {
+  return {
+    eventType: delivery.eventType,
+    sentAt: new Date().toISOString(),
+    payload,
+    deliveryId: delivery.id,
+  };
+}
+
 export function verifyWebhookSignature(
   secret: string,
   payload: unknown,
@@ -608,11 +664,7 @@ async function deliverWithRetry(
   delivery.attempts = attempt;
   delivery.updatedAt = new Date().toISOString();
 
-  const envelope = {
-    eventType: delivery.eventType,
-    sentAt: new Date().toISOString(),
-    payload,
-  };
+  const envelope = buildWebhookSignedEnvelope(delivery, payload);
 
   const body = JSON.stringify(envelope);
   const headers: Record<string, string> = {

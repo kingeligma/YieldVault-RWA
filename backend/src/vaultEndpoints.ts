@@ -15,6 +15,7 @@ import { emitTransactionEvent, TransactionEventType } from './webhookDelivery';
 import { validate, VaultOperationSchema } from './middleware/validate';
 import { withdrawalDailyLimitMiddleware } from './middleware/withdrawalDailyLimit';
 import { requireSignedWalletAction } from './middleware/walletSignedAction';
+import { sendUpstreamErrorResponse, withUpstreamErrorBoundary } from './middleware/upstreamErrorBoundary';
 import crypto from 'crypto';
 // crypto is still used below for generateFingerprint and body.id generation.
 import { tryAcquireWalletLock } from './walletLock';
@@ -312,6 +313,9 @@ async function handleVaultOperation(
       error: err instanceof Error ? err.message : String(err),
       traceId: getCurrentTraceId(),
     });
+    if (sendUpstreamErrorResponse(res, req, err, `Failed to process ${type}`)) {
+      return res;
+    }
     return res.status(500).json({
       error: 'Internal Server Error',
       status: 500,
@@ -334,7 +338,7 @@ router.post(
   requireSignedWalletAction('deposit'),
   allowlistMiddleware,
   validate({ body: VaultOperationSchema }),
-  (req: Request, res: Response) => handleVaultOperation(req, res, 'deposit'),
+  withUpstreamErrorBoundary((req: Request, res: Response) => handleVaultOperation(req, res, 'deposit')),
 );
 
 /**
@@ -350,7 +354,7 @@ router.post(
   allowlistMiddleware,
   validate({ body: VaultOperationSchema }),
   withdrawalDailyLimitMiddleware(),
-  (req: Request, res: Response) => handleVaultOperation(req, res, 'withdrawal'),
+  withUpstreamErrorBoundary((req: Request, res: Response) => handleVaultOperation(req, res, 'withdrawal')),
 );
 
 // ─── Feature-flagged v2 endpoints ────────────────────────────────────────────
@@ -367,7 +371,7 @@ router.post(
   requireSignedWalletAction('deposit'),
   requireFlag('deposit-v2'),
   validate({ body: VaultOperationSchema }),
-  (req: Request, res: Response) => handleVaultOperation(req, res, 'deposit'),
+  withUpstreamErrorBoundary((req: Request, res: Response) => handleVaultOperation(req, res, 'deposit')),
 );
 
 /**

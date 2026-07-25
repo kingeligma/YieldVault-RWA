@@ -25,6 +25,7 @@ import {
 import { DateRangeParseError, parseUtcDateRange, type ParsedUtcDateRange } from './dateRange';
 import { getApyHistory } from './apySnapshot';
 import { cacheMiddleware } from './middleware/cache';
+import { sendUpstreamErrorResponse } from './middleware/upstreamErrorBoundary';
 import { requireAuth, AuthenticatedRequest } from './auth';
 import { normalizeWalletAddress } from './walletUtils';
 import { validateApiKey } from './middleware/apiKeyAuth';
@@ -37,6 +38,7 @@ import {
 
 const router = Router();
 const CACHE_TTL_MS = parseInt(process.env.CACHE_LIST_ENDPOINTS_TTL_MS || '30000', 10);
+const APY_HISTORY_TIMEOUT_MS = parseInt(process.env.APY_HISTORY_TIMEOUT_MS || '25', 10);
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -699,6 +701,9 @@ router.get('/transactions', cacheMiddleware({ ttl: CACHE_TTL_MS }), (req: Reques
       return;
     }
     console.error('Error fetching transactions:', error);
+    if (sendUpstreamErrorResponse(res, req, error, 'Failed to fetch transactions')) {
+      return;
+    }
     res.status(500).json({
       error: 'Internal Server Error',
       status: 500,
@@ -785,6 +790,9 @@ router.get('/vault/transactions/export', authenticateTransactionExport, async (r
     res.setHeader('X-Export-Metadata', buildExportMetadataHeaderValue(job));
     res.status(200).send(artifact.body);
   } catch (error) {
+    if (sendUpstreamErrorResponse(res, req, error, 'Failed to generate transaction export')) {
+      return;
+    }
     res.status(500).json({
       error: 'Internal Server Error',
       status: 500,
@@ -826,6 +834,9 @@ router.get('/portfolio/holdings', cacheMiddleware({ ttl: CACHE_TTL_MS }), (req: 
     sendPaginatedResponse(res, response.data, response.pagination);
   } catch (error) {
     console.error('Error fetching portfolio holdings:', error);
+    if (sendUpstreamErrorResponse(res, req, error, 'Failed to fetch portfolio holdings')) {
+      return;
+    }
     res.status(500).json({
       error: 'Internal Server Error',
       status: 500,
@@ -875,6 +886,9 @@ router.get('/vault/history', cacheMiddleware({ ttl: CACHE_TTL_MS }), (req: Reque
       return;
     }
     console.error('Error fetching vault history:', error);
+    if (sendUpstreamErrorResponse(res, req, error, 'Failed to fetch vault history')) {
+      return;
+    }
     res.status(500).json({
       error: 'Internal Server Error',
       status: 500,
@@ -921,7 +935,19 @@ router.get('/vault/apy/history', cacheMiddleware({ ttl: parseInt(process.env.CAC
     const rawDays = parseInt((req.query.days as string) || '30', 10);
     const days = Number.isFinite(rawDays) ? rawDays : 30;
 
-    const data = await getApyHistory(days);
+    const { data, timedOut } = await getApyHistoryWithinBudget(days);
+
+    if (timedOut) {
+      res.status(200).json({
+        data,
+        days,
+        count: data.length,
+        fallback: true,
+        fallbackReason: 'upstream_timeout',
+        timeoutMs: APY_HISTORY_TIMEOUT_MS,
+      });
+      return;
+    }
 
     res.json({
       data,
@@ -930,6 +956,9 @@ router.get('/vault/apy/history', cacheMiddleware({ ttl: parseInt(process.env.CAC
     });
   } catch (err) {
     console.error('Error fetching APY history:', err);
+    if (sendUpstreamErrorResponse(res, req, err, 'Failed to fetch APY history')) {
+      return;
+    }
     res.status(500).json({
       error: 'Internal Server Error',
       status: 500,
@@ -937,5 +966,33 @@ router.get('/vault/apy/history', cacheMiddleware({ ttl: parseInt(process.env.CAC
     });
   }
 });
+
+async function getApyHistoryWithinBudget(days: number): Promise<{
+  data: Awaited<ReturnType<typeof getApyHistory>>;
+  timedOut: boolean;
+}> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
+
+  try {
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        reject(new Error(`APY history timed out after ${APY_HISTORY_TIMEOUT_MS}ms`));
+      }, APY_HISTORY_TIMEOUT_MS);
+    });
+
+    const data = await Promise.race([getApyHistory(days), timeoutPromise]);
+    return { data, timedOut: false };
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('APY history timed out')) {
+      return { data: [], timedOut: true };
+    }
+
+    throw error;
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+}
 
 export default router;

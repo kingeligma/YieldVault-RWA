@@ -10,6 +10,12 @@ import {
   todayUtc,
   dateMinusDays,
 } from '../apySnapshot';
+import { registerApiKey } from '../middleware/apiKeyAuth';
+import { db } from '../database';
+
+const adminApiKey = 'admin-apy-export-test-key';
+
+registerApiKey(adminApiKey);
 
 describe('APY Snapshot – unit', () => {
   describe('todayUtc()', () => {
@@ -102,5 +108,69 @@ describe('GET /api/v1/vault/apy/history', () => {
     const res = await request(app).get('/api/v1/vault/apy/history?days=abc');
     expect(res.status).toBe(200);
     expect(res.body.days).toBe(30);
+  });
+});
+
+describe('GET /admin/apy/export', () => {
+  it('returns JSON export data for the requested window', async () => {
+    const res = await request(app)
+      .get('/admin/apy/export?days=7&format=json')
+      .set('Authorization', `ApiKey ${adminApiKey}`);
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      exportType: 'apySnapshots',
+      format: 'json',
+      days: 7,
+    });
+    expect(Array.isArray(res.body.data)).toBe(true);
+  });
+
+  it('returns CSV export content with download headers', async () => {
+    const res = await request(app)
+      .get('/admin/apy/export?days=1&format=csv')
+      .set('Authorization', `ApiKey ${adminApiKey}`);
+
+    expect(res.status).toBe(200);
+    expect(res.headers['content-type']).toContain('text/csv');
+    expect(res.headers['content-disposition']).toContain('attachment; filename="apy-snapshots-');
+    expect(res.text).toContain('date,apy');
+  });
+
+  it('rejects unsupported export formats', async () => {
+    const res = await request(app)
+      .get('/admin/apy/export?format=xml')
+      .set('Authorization', `ApiKey ${adminApiKey}`);
+
+    expect(res.status).toBe(400);
+    expect(res.body.message).toMatch(/format must be either csv or json/i);
+  });
+});
+
+describe('GET /api/v1/vault/apy/history timeout fallback', () => {
+  it('returns a structured fallback payload when APY history exceeds budget', async () => {
+    const spy = jest.spyOn(db, 'query').mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          setTimeout(() => {
+            resolve({ rows: [{ date: '2026-06-23', apy: 8.5 }] });
+          }, 50);
+        }) as Promise<{ rows: Array<{ date: string; apy: number }> }>,
+    );
+
+    try {
+      const res = await request(app).get('/api/v1/vault/apy/history?days=1');
+
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({
+        fallback: true,
+        fallbackReason: 'upstream_timeout',
+        timeoutMs: 25,
+      });
+      expect(Array.isArray(res.body.data)).toBe(true);
+      expect(res.body.count).toBe(0);
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

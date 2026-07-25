@@ -29,7 +29,7 @@ import {
   type ImpersonationSessionRecord,
 } from './impersonationSessionService';
 import { generateAdminReceipt, getAdminReceipt, listAdminReceipts, verifyReceiptSignature } from './adminReceipt';
-import { startApySnapshotScheduler } from './apySnapshot';
+import { getApyHistory, startApySnapshotScheduler, type ApySnapshot } from './apySnapshot';
 import { startDbBackupScheduler } from './dbBackupJob';
 import { sorobanCircuitBreaker } from './circuitBreaker';
 import { correlationIdMiddleware, CorrelationIdRequest } from './middleware/correlationId';
@@ -44,6 +44,7 @@ import {
   setWithdrawalLimitOverride,
   listWithdrawalLimitAuditEntries,
 } from './middleware/withdrawalDailyLimit';
+import { sendUpstreamErrorResponse } from './middleware/upstreamErrorBoundary';
 import {
   validateApiKey,
   authenticateApiKeyValue,
@@ -95,6 +96,7 @@ import {
 import { latencyMonitoringService } from './latencyMonitoring';
 import { startEventPollingService, stopEventPollingService } from './eventPollingService';
 import { prisma, getPrismaRuntimeConfig } from './prisma';
+import { getPrismaClient } from './prismaClient';
 import {
   verifyWebhookEndpoint,
   registerWebhookEndpoint,
@@ -925,6 +927,71 @@ app.post('/admin/apy/backfill', validateApiKey, async (req: Request, res: Respon
       error: 'Internal Server Error',
       status: 500,
       message: err instanceof Error ? err.message : String(err),
+    });
+  }
+});
+
+/**
+ * GET /admin/apy/export - export APY snapshots for governance reporting
+ * Query: ?format=csv|json&days=1..90
+ */
+app.get('/admin/apy/export', validateApiKey, async (req: Request, res: Response) => {
+  const rawFormat = typeof req.query.format === 'string' ? req.query.format.toLowerCase() : 'json';
+  const format = rawFormat === 'csv' || rawFormat === 'json' ? rawFormat : null;
+  if (!format) {
+    res.status(400).json({
+      error: 'Bad Request',
+      status: 400,
+      message: 'format must be either csv or json',
+    });
+    return;
+  }
+
+  const rawDays = typeof req.query.days === 'string' ? Number.parseInt(req.query.days, 10) : 30;
+  const days = Number.isFinite(rawDays) ? Math.min(Math.max(rawDays, 1), 90) : 30;
+  const actor = resolveActingAdminAddress(req);
+
+  try {
+    const snapshots = await getApyHistory(days);
+    const generatedAt = new Date().toISOString();
+
+    void recordAdminAuditLog(req, 'apy.export', 200, {
+      actor,
+      format,
+      days,
+      count: snapshots.length,
+    });
+
+    if (format === 'csv') {
+      const csvLines = ['date,apy', ...snapshots.map((snapshot: ApySnapshot) => `${snapshot.date},${snapshot.apy}`)];
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', `attachment; filename="apy-snapshots-${generatedAt.slice(0, 10)}.csv"`);
+      res.status(200).send(csvLines.join('\n'));
+      return;
+    }
+
+    res.status(200).json({
+      exportType: 'apySnapshots',
+      format,
+      days,
+      count: snapshots.length,
+      generatedAt,
+      data: snapshots,
+    });
+  } catch (error) {
+    if (error instanceof DateRangeParseError) {
+      res.status(error.status).json({
+        error: 'Bad Request',
+        status: error.status,
+        message: error.message,
+      });
+      return;
+    }
+
+    res.status(500).json({
+      error: 'Internal Server Error',
+      status: 500,
+      message: error instanceof Error ? error.message : 'Failed to export APY snapshots',
     });
   }
 });
@@ -2306,6 +2373,9 @@ app.post('/admin/webhooks/dead-letter/:id/retry', validateApiKey, async (req: Re
       deadLetter: entry,
     });
   } catch (error) {
+    if (sendUpstreamErrorResponse(res, req, error, 'Failed to retry dead-letter entry')) {
+      return;
+    }
     res.status(500).json({
       error: 'Internal Server Error',
       status: 500,
@@ -3015,6 +3085,10 @@ const errorHandler: ErrorRequestHandler = (
   res: Response,
   _next: NextFunction,
 ) => {
+  if (sendUpstreamErrorResponse(res, req, err, 'An upstream dependency failed')) {
+    return;
+  }
+
   logger.log('error', 'Unhandled error', {
     correlationId: req.correlationId,
     traceId: getCurrentTraceId(),

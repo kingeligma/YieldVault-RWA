@@ -138,6 +138,13 @@ See [Disaster Recovery Runbooks](./docs/runbooks/README.md) for detailed procedu
 - **Phase 3**: Stellar Testnet Deployment and Frontend Integration (Up next)
 - **Phase 4**: Security Audit and Mainnet Launch
 
+### Quarterly Milestones
+
+- **Q1**: Finalize product scope, harden core vault flows, and complete baseline integration testing.
+- **Q2**: Ship testnet-ready contract and frontend integration, then close critical polish gaps.
+- **Q3**: Expand security review, run load and failure-mode validation, and prepare launch readiness.
+- **Q4**: Complete mainnet launch checklist, monitor production stability, and gather retrospective improvements.
+
 ## 🤝 Contributing
 
 Fork the repository and clone it to your local machine

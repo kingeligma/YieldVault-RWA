@@ -14,6 +14,7 @@ import {
 import { DateRangeParseError, parseUtcDateRange, type ParsedUtcDateRange } from './dateRange';
 import { buildTransactionsResponse } from './listEndpoints';
 import { cacheMiddleware } from './middleware/cache';
+import { sendUpstreamErrorResponse } from './middleware/upstreamErrorBoundary';
 
 const router = Router();
 const CACHE_TTL_MS = parseInt(process.env.CACHE_LIST_ENDPOINTS_TTL_MS || '30000', 10);
@@ -242,6 +243,10 @@ router.get('/', cacheMiddleware({ ttl: CACHE_TTL_MS }), async (req: Request, res
         error: err instanceof Error ? err.message : String(err),
         traceId,
       });
+
+      if (sendUpstreamErrorResponse(res, req, err, 'Failed to retrieve transaction history')) {
+        return;
+      }
 
       res.status(500).json({
         error: 'Internal Server Error',
