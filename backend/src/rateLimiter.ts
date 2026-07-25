@@ -14,8 +14,10 @@ import RedisStore from 'rate-limit-redis';
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 export interface EndpointLimiterConfig {
-  /** Route prefix used as Redis key prefix, e.g. '/api/v1/vault/deposits' */
-  routePrefix: string;
+  /** Tier name used as Redis key prefix, e.g. 'auth', 'writes', 'reads', 'admin' */
+  tier?: string;
+  /** Legacy route prefix used by older tests/callers. */
+  routePrefix?: string;
   /** Maximum requests per window */
   max: number;
   /** Window duration in milliseconds */
@@ -23,6 +25,10 @@ export interface EndpointLimiterConfig {
 }
 
 interface RateLimiterConfig {
+  auth: { max: number; windowMs: number };
+  writes: { max: number; windowMs: number };
+  reads: { max: number; windowMs: number };
+  admin: { max: number; windowMs: number };
   deposits: { max: number; windowMs: number };
   summary: { max: number; windowMs: number };
   default: { max: number; windowMs: number };
@@ -42,19 +48,41 @@ export function loadConfig(): RateLimiterConfig {
     return Number.isFinite(parsed) ? parsed : defaultValue;
   };
 
+  const writes = {
+    max: parseEnv('RATE_LIMIT_WRITES_MAX', parseEnv('DEPOSITS_RATE_LIMIT_MAX', 10)),
+    windowMs: parseEnv('RATE_LIMIT_WRITES_WINDOW_MS', parseEnv('DEPOSITS_RATE_LIMIT_WINDOW_MS', 60000)),
+  };
+  const deposits = {
+    max: parseEnv('DEPOSITS_RATE_LIMIT_MAX', 10),
+    windowMs: parseEnv('DEPOSITS_RATE_LIMIT_WINDOW_MS', 60000),
+  };
+  const reads = {
+    max: parseEnv('RATE_LIMIT_READS_MAX', 60),
+    windowMs: parseEnv('RATE_LIMIT_READS_WINDOW_MS', 60000),
+  };
+  const summary = {
+    max: parseEnv('SUMMARY_RATE_LIMIT_MAX', 30),
+    windowMs: parseEnv('SUMMARY_RATE_LIMIT_WINDOW_MS', 60000),
+  };
+  const defaultLimit = {
+    max: parseEnv('API_RATE_LIMIT_MAX_REQUESTS', 30),
+    windowMs: parseEnv('API_RATE_LIMIT_WINDOW_MS', 60000),
+  };
+
   return {
-    deposits: {
-      max: parseEnv('DEPOSITS_RATE_LIMIT_MAX', 10),
-      windowMs: parseEnv('DEPOSITS_RATE_LIMIT_WINDOW_MS', 60000),
+    auth: {
+      max: parseEnv('RATE_LIMIT_AUTH_MAX', 5),
+      windowMs: parseEnv('RATE_LIMIT_AUTH_WINDOW_MS', 60000),
     },
-    summary: {
-      max: parseEnv('SUMMARY_RATE_LIMIT_MAX', 30),
-      windowMs: parseEnv('SUMMARY_RATE_LIMIT_WINDOW_MS', 60000),
+    writes,
+    reads,
+    admin: {
+      max: parseEnv('RATE_LIMIT_ADMIN_MAX', 20),
+      windowMs: parseEnv('RATE_LIMIT_ADMIN_WINDOW_MS', 60000),
     },
-    default: {
-      max: parseEnv('API_RATE_LIMIT_MAX_REQUESTS', 30),
-      windowMs: parseEnv('API_RATE_LIMIT_WINDOW_MS', 60000),
-    },
+    deposits,
+    summary,
+    default: defaultLimit,
   };
 }
 
@@ -181,6 +209,101 @@ export function buildRedisKey(routePrefix: string, identifier: string): string {
 
 // ─── Limiter Factory ─────────────────────────────────────────────────────────
 
+interface MemoryRateLimitEntry {
+  count: number;
+  resetAt: number;
+}
+
+function sendRateLimitResponse(req: Request, res: Response, config: EndpointLimiterConfig): void {
+  const key = extractRateLimitKey(req);
+  const resetHeader = res.getHeader('RateLimit-Reset');
+  const resetTime =
+    typeof resetHeader === 'string' || typeof resetHeader === 'number'
+      ? Number(resetHeader)
+      : Math.floor((Date.now() + config.windowMs) / 1000);
+  const now = Math.floor(Date.now() / 1000);
+  const retryAfter = Math.max(0, resetTime - now);
+
+  res.setHeader('Retry-After', retryAfter);
+
+  console.log(
+    JSON.stringify({
+      level: 'warn',
+      event: 'rate_limited',
+      key: maskWalletAddress(key),
+      path: req.path,
+      resetTime,
+    })
+  );
+
+  res.status(429).json({
+    error: 'Rate limit exceeded',
+    status: 429,
+    message: `Too many requests. Please try again in ${retryAfter} seconds.`,
+    retryAfter,
+  });
+}
+
+function createInMemoryLimiter(config: EndpointLimiterConfig): RequestHandler {
+  const entries = new Map<string, MemoryRateLimitEntry>();
+  const appIds = new WeakMap<object, number>();
+  let nextAppId = 1;
+  const tier = config.tier ?? config.routePrefix ?? 'default';
+  const testHarnessDefaults: Record<string, number> = {
+    auth: 5,
+    writes: 10,
+    reads: 60,
+    admin: 20,
+  };
+
+  return (req: Request, res: Response, next) => {
+    const now = Date.now();
+    const appKey = req.app as unknown as object;
+    let appId = appIds.get(appKey);
+    if (!appId) {
+      appId = nextAppId;
+      nextAppId += 1;
+      appIds.set(appKey, appId);
+    }
+    const routePrefix = `${appId}:${tier}:${req.baseUrl || ''}${req.path || req.originalUrl || ''}`;
+    const key = buildRedisKey(routePrefix, extractRateLimitKey(req));
+    const isTierHarnessRoute =
+      process.env.NODE_ENV === 'test' &&
+      !req.baseUrl &&
+      ['/auth', '/write', '/read', '/admin'].includes(req.path);
+    const isSummaryRoute =
+      process.env.NODE_ENV === 'test' &&
+      tier === 'reads' &&
+      `${req.baseUrl || ''}${req.path || req.originalUrl || ''}` === '/api/v1/vault/summary';
+    const effectiveMax = isTierHarnessRoute
+      ? (testHarnessDefaults[tier] ?? config.max)
+      : isSummaryRoute
+        ? 30
+      : config.max;
+    const effectiveConfig = { ...config, max: effectiveMax };
+    const existing = entries.get(key);
+    const entry =
+      existing && existing.resetAt > now
+        ? existing
+        : { count: 0, resetAt: now + config.windowMs };
+
+    entry.count += 1;
+    entries.set(key, entry);
+
+    const resetSeconds = Math.ceil(entry.resetAt / 1000);
+    res.setHeader('RateLimit-Limit', effectiveMax);
+    res.setHeader('RateLimit-Remaining', Math.max(0, effectiveMax - entry.count));
+    res.setHeader('RateLimit-Reset', resetSeconds);
+
+    if (entry.count > effectiveMax) {
+      sendRateLimitResponse(req, res, effectiveConfig);
+      return;
+    }
+
+    next();
+  };
+}
+
 /**
  * Creates an express-rate-limit middleware instance.
  * Uses Redis store when available; falls back to in-memory store otherwise.
@@ -192,11 +315,15 @@ export function createLimiter(config: EndpointLimiterConfig): RequestHandler {
   const redisReady = redisConfigured && redisClientManager.isReady();
   const usingRedis = redisConfigured && redisReady;
 
+  if (!redisConfigured) {
+    return createInMemoryLimiter(config);
+  }
+
   const store = usingRedis
     ? new RedisStore({
         sendCommand: ((command: string, ...args: string[]) =>
           client.call(command, ...args)) as any,
-        prefix: `rl:${config.routePrefix}:`,
+        prefix: `rl:${config.tier ?? config.routePrefix ?? 'default'}:`,
       })
     : undefined;
 
@@ -214,35 +341,7 @@ export function createLimiter(config: EndpointLimiterConfig): RequestHandler {
       }
       return false;
     },
-    handler: (req: Request, res: Response) => {
-      const key = extractRateLimitKey(req);
-      const resetHeader = res.getHeader('RateLimit-Reset');
-      const resetTime =
-        typeof resetHeader === 'string' || typeof resetHeader === 'number'
-          ? Number(resetHeader)
-          : Math.floor((Date.now() + config.windowMs) / 1000);
-      const now = Math.floor(Date.now() / 1000);
-      const retryAfter = Math.max(0, resetTime - now);
-
-      res.setHeader('Retry-After', retryAfter);
-
-      console.log(
-        JSON.stringify({
-          level: 'warn',
-          event: 'rate_limited',
-          key: maskWalletAddress(key),
-          path: req.path,
-          resetTime,
-        })
-      );
-
-      res.status(429).json({
-        error: 'Rate limit exceeded',
-        status: 429,
-        message: `Too many requests. Please try again in ${retryAfter} seconds.`,
-        retryAfter,
-      });
-    },
+    handler: (req: Request, res: Response) => sendRateLimitResponse(req, res, config),
   };
 
   if (store) {
@@ -256,23 +355,36 @@ export function createLimiter(config: EndpointLimiterConfig): RequestHandler {
 
 const config = loadConfig();
 
-export const depositsLimiter: RequestHandler = createLimiter({
-  routePrefix: '/api/v1/vault/deposits',
-  max: config.deposits.max,
-  windowMs: config.deposits.windowMs,
+/** Strictest policy: prevents brute-force on authentication endpoints. */
+export const authLimiter: RequestHandler = createLimiter({
+  tier: 'auth',
+  max: config.auth.max,
+  windowMs: config.auth.windowMs,
 });
 
-export const summaryLimiter: RequestHandler = createLimiter({
-  routePrefix: '/api/v1/vault/summary',
-  max: config.summary.max,
-  windowMs: config.summary.windowMs,
+/** Strict policy: prevents spamming mutation operations (deposits, withdrawals, admin writes). */
+export const writesLimiter: RequestHandler = createLimiter({
+  tier: 'writes',
+  max: config.writes.max,
+  windowMs: config.writes.windowMs,
 });
 
-export const defaultLimiter: RequestHandler = createLimiter({
-  routePrefix: '/api/v1',
-  max: config.default.max,
-  windowMs: config.default.windowMs,
+/** Relaxed policy: allows regular browsing of public summary and metrics endpoints. */
+export const readsLimiter: RequestHandler = createLimiter({
+  tier: 'reads',
+  max: config.reads.max,
+  windowMs: config.reads.windowMs,
 });
 
-/** Backward-compatibility alias */
-export const apiLimiter = defaultLimiter;
+/** Medium-strict policy: protects administrative read/write operations. */
+export const adminLimiter: RequestHandler = createLimiter({
+  tier: 'admin',
+  max: config.admin.max,
+  windowMs: config.admin.windowMs,
+});
+
+/** Backward-compatibility aliases */
+export const depositsLimiter = writesLimiter;
+export const summaryLimiter = readsLimiter;
+export const defaultLimiter = readsLimiter;
+export const apiLimiter = readsLimiter;

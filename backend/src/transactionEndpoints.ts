@@ -2,16 +2,22 @@ import { Router, Request, Response } from 'express';
 import { logger } from './middleware/structuredLogging';
 import { withSpan, getCurrentTraceId } from './tracing';
 import { getPrismaClient } from './prismaClient';
+import { normalizeWalletAddress } from './walletUtils';
 import {
   parsePaginationQuery,
   sendPaginatedResponse,
   DEFAULT_PAGINATION_CONFIG,
   encodeCursor,
   decodeCursor,
+  createPaginationEnvelope,
 } from './pagination';
-import { parseUtcDateRange, type ParsedUtcDateRange } from './dateRange';
+import { DateRangeParseError, parseUtcDateRange, type ParsedUtcDateRange } from './dateRange';
+import { buildTransactionsResponse } from './listEndpoints';
+import { cacheMiddleware } from './middleware/cache';
+import { sendUpstreamErrorResponse } from './middleware/upstreamErrorBoundary';
 
 const router = Router();
+const CACHE_TTL_MS = parseInt(process.env.CACHE_LIST_ENDPOINTS_TTL_MS || '30000', 10);
 
 /**
  * GET /api/v1/transactions
@@ -29,14 +35,43 @@ const router = Router();
  * 
  * Response: Paginated list of transactions with total count and no duplicate results across pages
  */
-router.get('/', async (req: Request, res: Response) => {
+router.get('/', cacheMiddleware({ ttl: CACHE_TTL_MS }), async (req: Request, res: Response) => {
   const traceId = getCurrentTraceId();
 
   return await withSpan('transactions.list', async (span) => {
     try {
-      const { type, status } = req.query;
+      const { type, status, walletAddress } = req.query;
       const from = req.query.from as string | undefined;
       const to = req.query.to as string | undefined;
+
+      if (!walletAddress) {
+        try {
+          const response = buildTransactionsResponse({
+            limit: typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : undefined,
+            cursor: typeof req.query.cursor === 'string' ? req.query.cursor : undefined,
+            page: typeof req.query.page === 'string' ? parseInt(req.query.page, 10) : undefined,
+            sortBy: typeof req.query.sortBy === 'string' ? req.query.sortBy : undefined,
+            sortOrder: req.query.sortOrder === 'asc' ? 'asc' : 'desc',
+            type: typeof type === 'string' ? type : undefined,
+            status: typeof status === 'string' ? status : undefined,
+            from,
+            to,
+          });
+          res.status(200).json(response);
+        } catch (err) {
+          if (err instanceof DateRangeParseError) {
+            res.status(400).json({
+              error: 'Bad Request',
+              status: 400,
+              message: err.message,
+            });
+            return;
+          }
+
+          throw err;
+        }
+        return;
+      }
 
       // Validate type filter if provided
       const validTypes = ['deposit', 'withdrawal'];
@@ -83,6 +118,7 @@ router.get('/', async (req: Request, res: Response) => {
       span.setAttributes({
         'transaction.typeFilter': typeFilter.length > 0 ? typeFilter.join(',') : 'all',
         'transaction.statusFilter': status ? String(status) : 'all',
+        'transaction.walletFilter': walletAddress ? normalizeWalletAddress(String(walletAddress)) : 'all',
         'transaction.hasDateRange': !!(dateRange.start || dateRange.end),
         'pagination.limit': paginationQuery.limit,
         'pagination.hasCursor': !!paginationQuery.cursor,
@@ -99,6 +135,10 @@ router.get('/', async (req: Request, res: Response) => {
 
       if (status) {
         whereClause.status = String(status);
+      }
+
+      if (walletAddress) {
+        whereClause.user = normalizeWalletAddress(String(walletAddress));
       }
 
       if (dateRange.start || dateRange.end) {
@@ -175,13 +215,14 @@ router.get('/', async (req: Request, res: Response) => {
       const data = hasMore ? transactions.slice(0, limit) : transactions;
 
       // Build pagination metadata
-      const pagination = {
+      const pagination = createPaginationEnvelope({
         count: data.length,
+        limit,
         total,
         hasNextPage: hasMore,
         hasPrevPage: skip > 0,
-        ...(hasMore && data.length > 0 ? { nextCursor: encodeCursor(data[data.length - 1].id) } : {}),
-      };
+        nextCursor: hasMore && data.length > 0 ? encodeCursor(data[data.length - 1].id) : null,
+      });
 
       span.setAttributes({
         'transaction.count': data.length,
@@ -202,6 +243,10 @@ router.get('/', async (req: Request, res: Response) => {
         error: err instanceof Error ? err.message : String(err),
         traceId,
       });
+
+      if (sendUpstreamErrorResponse(res, req, err, 'Failed to retrieve transaction history')) {
+        return;
+      }
 
       res.status(500).json({
         error: 'Internal Server Error',

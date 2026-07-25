@@ -1,161 +1,238 @@
 import type { Request, Response, NextFunction } from 'express';
 import { cacheHitCount, cacheMissCount, cacheEvictionCount } from '../metrics';
-
-const MAX_ENTRIES = parseInt(process.env.CACHE_MAX_ENTRIES || '1000', 10);
+import { latencyMonitoringService } from '../latencyMonitoring';
 
 interface CacheEntry {
   data: unknown;
+  statusCode: number;
+  headers: Record<string, string>;
   expiresAt: number;
-  /** Timestamp of last access for LRU eviction */
-  lastAccessed: number;
+  ttl: number; // original ttl in ms, for Cache-Control on miss
+  lastUsed: number; // timestamp for LRU eviction
 }
 
-/**
- * LRU cache implementation with TTL support.
- * Uses Map for O(1) operations and maintains insertion/access order.
- */
-class LRUCache<K, V> {
-  private cache: Map<K, V>;
+// ── LRU Cache Store ──────────────────────────────────────────────────────────
+
+const DEFAULT_MAX_ENTRIES = 500;
+
+function resolveMaxEntries(): number {
+  const raw = process.env.CACHE_MAX_ENTRIES;
+  if (!raw) return DEFAULT_MAX_ENTRIES;
+  const n = parseInt(raw, 10);
+  if (!Number.isInteger(n) || n < 1) {
+    console.warn(
+      `[cache] CACHE_MAX_ENTRIES="${raw}" is not a positive integer — falling back to default ${DEFAULT_MAX_ENTRIES}`,
+    );
+    return DEFAULT_MAX_ENTRIES;
+  }
+  return n;
+}
+
+class LruCacheStore {
+  private store = new Map<string, CacheEntry>();
   private maxEntries: number;
 
-  constructor(maxEntries: number) {
-    this.cache = new Map<K, V>();
-    this.maxEntries = maxEntries;
+  constructor() {
+    this.maxEntries = resolveMaxEntries();
   }
 
-  get(key: K): V | undefined {
-    const value = this.cache.get(key);
-    if (value !== undefined) {
-      // Move to end (most recently used)
-      this.cache.delete(key);
-      this.cache.set(key, value);
+  get(key: string): CacheEntry | undefined {
+    const entry = this.store.get(key);
+    if (entry) {
+      entry.lastUsed = Date.now();
     }
-    return value;
+    return entry;
   }
 
-  set(key: K, value: V): void {
-    // If key exists, update it
-    if (this.cache.has(key)) {
-      this.cache.delete(key);
+  set(key: string, entry: CacheEntry): void {
+    const isUpdate = this.store.has(key);
+
+    if (!isUpdate && this.store.size >= this.maxEntries) {
+      this._evictLru();
     }
 
-    // Add new entry
-    this.cache.set(key, value);
-
-    // Evict if over capacity
-    if (this.cache.size > this.maxEntries) {
-      // Remove first entry (least recently used)
-      const firstKey = this.cache.keys().next().value;
-      if (firstKey !== undefined) {
-        this.cache.delete(firstKey);
-        cacheEvictionCount.inc();
-      }
-    }
+    entry.lastUsed = Date.now();
+    this.store.set(key, entry);
   }
 
-  delete(key: K): boolean {
-    return this.cache.delete(key);
+  delete(key: string): boolean {
+    return this.store.delete(key);
   }
 
   clear(): void {
-    this.cache.clear();
+    this.store.clear();
   }
 
-  size(): number {
-    return this.cache.size;
+  keys(): IterableIterator<string> {
+    return this.store.keys();
   }
 
-  keys(): IterableIterator<K> {
-    return this.cache.keys();
+  get size(): number {
+    return this.store.size;
   }
 
-  values(): IterableIterator<V> {
-    return this.cache.values();
+  private _evictLru(): void {
+    let oldestKey: string | undefined;
+    let oldestTime = Infinity;
+
+    for (const [key, entry] of this.store.entries()) {
+      if (entry.lastUsed < oldestTime) {
+        oldestTime = entry.lastUsed;
+        oldestKey = key;
+      }
+    }
+
+    if (oldestKey !== undefined) {
+      this.store.delete(oldestKey);
+      cacheEvictionCount.inc();
+    }
   }
 }
 
-const responseCache = new LRUCache<string, CacheEntry>(MAX_ENTRIES);
+export const responseCache = new LruCacheStore();
+
+// ── Cache Key ────────────────────────────────────────────────────────────────
+
+/**
+ * Build a deterministic cache key from the HTTP method, path, and query params.
+ * Query param names and multi-value lists are both sorted alphabetically so that
+ * ?a=2&a=1&b=3 and ?b=3&a=2&a=1 yield the same key.
+ */
+export function buildCacheKey(req: Request): string {
+  const query = req.query as Record<string, string | string[]>;
+  const keys = Object.keys(query).sort();
+
+  if (keys.length === 0) {
+    return `${req.method}:${req.path}`;
+  }
+
+  const pairs = keys.map((k) => {
+    const v = query[k];
+    const values = Array.isArray(v) ? [...v].sort() : [v];
+    return `${k}=${values.join(',')}`;
+  });
+
+  return `${req.method}:${req.path}:${pairs.join('&')}`;
+}
+
+// ── Middleware ────────────────────────────────────────────────────────────────
 
 export interface CacheOptions {
   ttl: number; // milliseconds
-}
-
-function normalizeCacheKey(req: Request): string {
-  const baseKey = `${req.method}:${req.path}`;
-  const queryEntries = Object.entries(req.query)
-    .filter(([, value]) => value !== undefined)
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([key, value]) =>
-      Array.isArray(value)
-        ? `${key}=${value.slice().sort().join(',')}`
-        : `${key}=${value}`,
-    );
-
-  return queryEntries.length ? `${baseKey}?${queryEntries.join('&')}` : baseKey;
+  /** When true, the middleware caches even when an Authorization header is present */
+  sharedCache?: boolean;
 }
 
 export function cacheMiddleware(options: CacheOptions) {
   return (req: Request, res: Response, next: NextFunction): void => {
+    // Only cache GET requests
     if (req.method !== 'GET') {
       next();
       return;
     }
 
-    const cacheKey = normalizeCacheKey(req);
+    // R10: skip caching for authenticated requests unless explicitly opted-in
+    if (!options.sharedCache && req.headers['authorization']) {
+      next();
+      return;
+    }
+
+    // R10: never cache /admin/audit/* routes
+    if (req.path.startsWith('/admin/audit')) {
+      next();
+      return;
+    }
+
+    const route = (req.route?.path as string | undefined) ?? req.path;
+    const cacheKey = buildCacheKey(req);
     const cached = responseCache.get(cacheKey);
 
     if (cached && cached.expiresAt > Date.now()) {
-      // Update last accessed timestamp for LRU ordering
-      cached.lastAccessed = Date.now();
+      // Cache HIT
+      const hitStart = Date.now();
+      cacheHitCount.inc({ method: req.method, route });
+
+      const remainingMs = cached.expiresAt - Date.now();
+      const remainingSec = Math.ceil(remainingMs / 1000);
+
       res.setHeader('X-Cache-Hit', 'true');
-      cacheHitCount.inc({ method: req.method, route: req.path });
-      res.json(cached.data);
+      res.setHeader('Cache-Control', `public, max-age=${Math.max(remainingSec, 0)}`);
+
+      // Restore any other cached response headers
+      for (const [name, value] of Object.entries(cached.headers)) {
+        if (name !== 'Cache-Control' && name !== 'X-Cache-Hit') {
+          res.setHeader(name, value);
+        }
+      }
+
+      res.status(cached.statusCode).json(cached.data);
+
+      // R9: record cached latency
+      latencyMonitoringService.recordLatency(route, Date.now() - hitStart, true);
       return;
     }
+
+    // Cache MISS — intercept the response to store it
+    const missStart = Date.now();
+    cacheMissCount.inc({ method: req.method, route });
 
     const originalJson = res.json.bind(res);
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     res.json = function (data: any) {
-      const successResponse = res.statusCode >= 200 && res.statusCode < 300;
-      if (successResponse) {
+      const status = res.statusCode ?? 200;
+
+      // R3 C3: only cache 2xx responses
+      if (status >= 200 && status < 300) {
+        const maxAgeSec = Math.ceil(options.ttl / 1000);
+        res.setHeader('X-Cache-Hit', 'false');
+        res.setHeader('Cache-Control', `public, max-age=${maxAgeSec}`);
+
         responseCache.set(cacheKey, {
           data,
+          statusCode: status,
+          headers: {},
           expiresAt: Date.now() + options.ttl,
-          lastAccessed: Date.now(),
+          ttl: options.ttl,
+          lastUsed: Date.now(),
         });
-        cacheMissCount.inc({ method: req.method, route: req.path });
-        res.setHeader(
-          'Cache-Control',
-          `public, max-age=${Math.ceil(options.ttl / 1000)}`,
-        );
-        res.setHeader('X-Cache-Hit', 'false');
       }
-      return originalJson(data);
+
+      const result = originalJson(data);
+      // R9: record uncached latency after response is written
+      latencyMonitoringService.recordLatency(route, Date.now() - missStart, false);
+      return result;
     } as typeof res.json;
 
     next();
   };
 }
 
-export function invalidateCache(pattern?: string): void {
+// ── Invalidation ─────────────────────────────────────────────────────────────
+
+export function invalidateCache(pattern?: string): number {
   if (!pattern) {
+    const count = responseCache.size;
     responseCache.clear();
-    return;
+    return count;
   }
 
   const regex = new RegExp(pattern);
-  for (const key of responseCache.keys()) {
+  let removed = 0;
+  for (const key of Array.from(responseCache.keys())) {
     if (regex.test(key)) {
       responseCache.delete(key);
+      removed++;
     }
   }
+  return removed;
 }
 
-export function getCacheStats(): { size: number; entries: string[]; maxEntries: number } {
+// ── Stats ─────────────────────────────────────────────────────────────────────
+
+export function getCacheStats(): { size: number; entries: string[] } {
   return {
-    size: responseCache.size(),
-    maxEntries: MAX_ENTRIES,
+    size: responseCache.size,
     entries: Array.from(responseCache.keys()),
   };
 }

@@ -2380,6 +2380,10 @@ button {
   color: var(--text-warning);
 }
 
+.receipt-empty-state {
+  max-width: 600px;
+}
+
 .receipt-back-link {
   display: inline-block;
   margin-top: 1rem;
@@ -2497,6 +2501,10 @@ button {
 
 .offline-banner--success {
   background: rgba(34, 197, 94, 0.95);
+}
+
+.offline-banner--retrying {
+  background: rgba(245, 158, 11, 0.95);
 }
 
 .offline-banner__content {

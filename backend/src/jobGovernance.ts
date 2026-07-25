@@ -1,4 +1,4 @@
-export type JobName = 'priceRefresh' | 'positionReconciliation' | 'reportGeneration';
+export type JobName = 'priceRefresh' | 'positionReconciliation' | 'reportGeneration' | 'databaseBackup' | 'apySnapshot';
 
 export interface JobPolicy {
   maxAttempts: number;
@@ -45,6 +45,18 @@ export const JOB_POLICIES: Record<JobName, JobPolicy> = {
     baseDelayMs: 5000,
     backoffMultiplier: 2,
     deadLetterThreshold: 2,
+  },
+  databaseBackup: {
+    maxAttempts: 3,
+    baseDelayMs: 10000,
+    backoffMultiplier: 2,
+    deadLetterThreshold: 2,
+  },
+  apySnapshot: {
+    maxAttempts: 3,
+    baseDelayMs: 1000,
+    backoffMultiplier: 2,
+    deadLetterThreshold: 3,
   },
 };
 
@@ -122,6 +134,10 @@ class JobGovernanceStore {
     return Object.keys(this.getMetrics().recurringFailures).length > 0;
   }
 
+  registerJob(jobName: JobName): void {
+    this.ensureRuntimeMetric(jobName);
+  }
+
   private ensureRuntimeMetric(jobName: JobName): JobRuntimeMetric {
     const existing = this.runtime.get(jobName);
     if (existing) {
@@ -187,6 +203,10 @@ export async function runJobWithRetry<T>(
 
 export function getJobMetrics() {
   return jobGovernanceStore.getMetrics();
+}
+
+export function registerJob(jobName: JobName): void {
+  jobGovernanceStore.registerJob(jobName);
 }
 
 export function getJobHealthStatus(): 'up' | 'degraded' {

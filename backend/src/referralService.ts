@@ -1,12 +1,19 @@
-import { PrismaClient } from '@prisma/client';
+import Decimal from 'decimal.js';
 import { getPrismaClient } from './prismaClient';
 import { logger } from './middleware/structuredLogging';
+import { normalizeWalletAddress } from './walletUtils';
+import { invalidateCache } from './middleware/cache';
 
 // Use the centralized Prisma Client instance
 const getPrisma = () => getPrismaClient();
 
 // Configurable reward percentage (default 5% if not set)
-const REFERRAL_REWARD_PERCENTAGE = parseFloat(process.env.REFERRAL_REWARD_PERCENTAGE || '0.05');
+const REFERRAL_REWARD_PERCENTAGE = new Decimal(
+  process.env.REFERRAL_REWARD_PERCENTAGE || '0.05',
+);
+const ZERO = new Decimal(0);
+const DEFAULT_SHARE_PRICE = new Decimal(1);
+const OUTPUT_DECIMAL_PLACES = 6;
 
 export class ReferralService {
   /**
@@ -15,6 +22,7 @@ export class ReferralService {
    */
   async recordDeposit(walletAddress: string, referralCode?: string): Promise<void> {
     const prisma = getPrisma();
+    const normalizedReferred = normalizeWalletAddress(walletAddress);
     try {
       await prisma.$transaction(async (tx) => {
         // 1. If code provided, ensure relationship exists
@@ -24,21 +32,22 @@ export class ReferralService {
           });
 
           if (code) {
+            const normalizedReferrer = normalizeWalletAddress(code.ownerAddress);
             // Check if user already has a referrer
             const existing = await tx.referral.findUnique({
-              where: { referredAddress: walletAddress },
+              where: { referredAddress: normalizedReferred },
             });
 
             if (!existing) {
               await tx.referral.create({
                 data: {
-                  referrerAddress: code.ownerAddress,
-                  referredAddress: walletAddress,
+                  referrerAddress: normalizedReferrer,
+                  referredAddress: normalizedReferred,
                 },
               });
               logger.log('info', 'New referral relationship recorded', {
-                referrer: code.ownerAddress,
-                referred: walletAddress,
+                referrer: normalizedReferrer,
+                referred: normalizedReferred,
               });
             }
           }
@@ -46,26 +55,29 @@ export class ReferralService {
 
         // 2. Check if this is the first deposit
         const referral = await tx.referral.findUnique({
-          where: { referredAddress: walletAddress },
+          where: { referredAddress: normalizedReferred },
         });
 
         if (referral && !referral.firstDepositAt) {
           await tx.referral.update({
-            where: { referredAddress: walletAddress },
+            where: { referredAddress: normalizedReferred },
             data: { firstDepositAt: new Date() },
           });
           logger.log('info', 'First deposit timestamp recorded for referral', {
-            referred: walletAddress,
+            referred: normalizedReferred,
           });
         }
       });
     } catch (error) {
       logger.log('error', 'Failed to record referral deposit', {
         error: error instanceof Error ? error.message : String(error),
-        walletAddress,
+        walletAddress: normalizedReferred,
       });
       // We don't throw here to avoid blocking the main deposit flow
+      return;
     }
+    // R5: invalidate referral cache entries after a successful deposit
+    invalidateCache('GET:/api/v1/referrals');
   }
 
   /**
@@ -74,9 +86,10 @@ export class ReferralService {
    */
   async getReferralStats(referrerAddress: string): Promise<{ referral_count: number; total_reward_earned: string } | null> {
     const prisma = getPrisma();
+    const normalizedReferrer = normalizeWalletAddress(referrerAddress);
     const referrals = await prisma.referral.findMany({
       where: {
-        referrerAddress,
+        referrerAddress: normalizedReferrer,
         firstDepositAt: { not: null },
       },
     });
@@ -85,42 +98,101 @@ export class ReferralService {
       return null;
     }
 
-    let totalReward = 0;
+    let totalReward = ZERO;
 
     for (const ref of referrals) {
-      const yield_earned = await this.calculateUserYield(ref.referredAddress);
-      if (yield_earned > 0) {
-        const reward = yield_earned * REFERRAL_REWARD_PERCENTAGE;
-        totalReward += reward;
+      const yield_earned = await this.calculateUserYield(normalizeWalletAddress(ref.referredAddress));
+      if (yield_earned.greaterThan(ZERO)) {
+        const reward = yield_earned.mul(REFERRAL_REWARD_PERCENTAGE);
+        totalReward = totalReward.plus(reward);
       }
     }
 
     return {
       referral_count: referrals.length,
-      total_reward_earned: totalReward.toFixed(6),
+      total_reward_earned: totalReward.toDecimalPlaces(OUTPUT_DECIMAL_PLACES).toFixed(OUTPUT_DECIMAL_PLACES),
     };
   }
 
   /**
-   * Mock implementation of yield calculation.
-   * In a real system, this would fetch user shares and current share price.
+   * Calculates user net yield from transaction history and persisted share price snapshots.
+   * Uses share-balance accounting so deposits and withdrawals across multiple periods
+   * are valued at the snapshot price in effect at the time of each transaction.
    */
-  private async calculateUserYield(walletAddress: string): Promise<number> {
+  async calculateUserYield(walletAddress: string): Promise<Decimal> {
     const prisma = getPrisma();
-    // For the purpose of this task, we'll simulate yield.
-    // In a real scenario, this would be: (shares * price) - totalDeposited
-    // Here we'll look for transactions to at least make it dynamic-ish if they exist.
-    const txs = await prisma.transaction.findMany({
-      where: { user: walletAddress, type: 'deposit' },
+    const normalizedWallet = normalizeWalletAddress(walletAddress);
+    const [transactions, snapshots] = await Promise.all([
+      prisma.transaction.findMany({
+        where: {
+          user: normalizedWallet,
+          type: { in: ['deposit', 'withdrawal'] },
+          OR: [{ status: null }, { status: 'completed' }, { status: 'pending' }],
+        },
+        orderBy: [{ timestamp: 'asc' }, { id: 'asc' }],
+      }),
+      prisma.sharePriceSnapshot.findMany({
+        orderBy: [{ recordedAt: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
+      }),
+    ]);
+
+    if (transactions.length === 0) {
+      this.logYieldCalculation(normalizedWallet, {
+        transactionCount: 0,
+        snapshotCount: snapshots.length,
+        totalDeposited: ZERO,
+        totalWithdrawn: ZERO,
+        endingShares: ZERO,
+        endingSharePrice: DEFAULT_SHARE_PRICE,
+        endingValue: ZERO,
+        netYield: ZERO,
+      });
+      return ZERO;
+    }
+
+    let totalDeposited = ZERO;
+    let totalWithdrawn = ZERO;
+    let sharesOwned = ZERO;
+
+    for (const tx of transactions) {
+      const amount = this.parseDecimal(tx.amount);
+      if (amount.lte(ZERO)) {
+        continue;
+      }
+
+      const sharePrice = this.resolveSharePriceForTimestamp(
+        snapshots,
+        tx.timestamp,
+      );
+
+      if (tx.type === 'deposit') {
+        totalDeposited = totalDeposited.plus(amount);
+        sharesOwned = sharesOwned.plus(amount.div(sharePrice));
+        continue;
+      }
+
+      const sharesToBurn = amount.div(sharePrice);
+      totalWithdrawn = totalWithdrawn.plus(amount);
+      sharesOwned = Decimal.max(ZERO, sharesOwned.minus(sharesToBurn));
+    }
+
+    const endingSharePrice = this.resolveLatestSharePrice(snapshots);
+    const endingValue = sharesOwned.mul(endingSharePrice);
+    const netYield = endingValue.plus(totalWithdrawn).minus(totalDeposited);
+    const nonNegativeNetYield = Decimal.max(ZERO, netYield);
+
+    this.logYieldCalculation(normalizedWallet, {
+      transactionCount: transactions.length,
+      snapshotCount: snapshots.length,
+      totalDeposited,
+      totalWithdrawn,
+      endingShares: sharesOwned,
+      endingSharePrice,
+      endingValue,
+      netYield: nonNegativeNetYield,
     });
 
-    if (txs.length === 0) return 0;
-
-    const totalDeposited = txs.reduce((sum: number, tx: any) => sum + parseFloat(tx.amount), 0);
-    
-    // Simulate 10% gain for demonstration purposes if there's no real price source
-    // Real logic would use: return currentUserValue.minus(totalDeposited).toDecimalPlaces(6);
-    return Number((totalDeposited * 0.1).toFixed(6));
+    return nonNegativeNetYield.toDecimalPlaces(OUTPUT_DECIMAL_PLACES);
   }
 
   /**
@@ -129,10 +201,11 @@ export class ReferralService {
    */
   async getOrCreateReferralCode(ownerAddress: string): Promise<string> {
     const prisma = getPrisma();
+    const normalizedOwner = normalizeWalletAddress(ownerAddress);
 
     // Check if code already exists
     const existing = await prisma.referralCode.findFirst({
-      where: { ownerAddress },
+      where: { ownerAddress: normalizedOwner },
     });
 
     if (existing) {
@@ -152,7 +225,7 @@ export class ReferralService {
 
     // Create new code
     await prisma.referralCode.create({
-      data: { code, ownerAddress },
+      data: { code, ownerAddress: normalizedOwner },
     });
 
     return code;
@@ -176,7 +249,81 @@ export class ReferralService {
   async createReferralCode(ownerAddress: string, code: string): Promise<void> {
     const prisma = getPrisma();
     await prisma.referralCode.create({
-      data: { code, ownerAddress },
+      data: { code, ownerAddress: normalizeWalletAddress(ownerAddress) },
+    });
+  }
+
+  private parseDecimal(value: string): Decimal {
+    try {
+      return new Decimal(value || '0');
+    } catch {
+      return ZERO;
+    }
+  }
+
+  private resolveLatestSharePrice(
+    snapshots: Array<{ sharePrice: string }>,
+  ): Decimal {
+    if (snapshots.length === 0) {
+      return DEFAULT_SHARE_PRICE;
+    }
+
+    return Decimal.max(
+      DEFAULT_SHARE_PRICE,
+      this.parseDecimal(snapshots[snapshots.length - 1].sharePrice),
+    );
+  }
+
+  private resolveSharePriceForTimestamp(
+    snapshots: Array<{ sharePrice: string; recordedAt: Date }>,
+    timestamp: Date,
+  ): Decimal {
+    const beforeOrAt = snapshots.filter(
+      (snapshot) => snapshot.recordedAt.getTime() <= timestamp.getTime(),
+    );
+
+    if (beforeOrAt.length > 0) {
+      return Decimal.max(
+        DEFAULT_SHARE_PRICE,
+        this.parseDecimal(beforeOrAt[beforeOrAt.length - 1].sharePrice),
+      );
+    }
+
+    if (snapshots.length > 0) {
+      return Decimal.max(
+        DEFAULT_SHARE_PRICE,
+        this.parseDecimal(snapshots[0].sharePrice),
+      );
+    }
+
+    return DEFAULT_SHARE_PRICE;
+  }
+
+  private logYieldCalculation(
+    normalizedWallet: string,
+    details: {
+      transactionCount: number;
+      snapshotCount: number;
+      totalDeposited: Decimal;
+      totalWithdrawn: Decimal;
+      endingShares: Decimal;
+      endingSharePrice: Decimal;
+      endingValue: Decimal;
+      netYield: Decimal;
+    },
+  ): void {
+    logger.log('info', 'Referral yield calculated', {
+      walletSuffix: normalizedWallet.slice(-6),
+      transactionCount: details.transactionCount,
+      snapshotCount: details.snapshotCount,
+      totalDeposited: details.totalDeposited.toFixed(OUTPUT_DECIMAL_PLACES),
+      totalWithdrawn: details.totalWithdrawn.toFixed(OUTPUT_DECIMAL_PLACES),
+      endingShares: details.endingShares.toFixed(OUTPUT_DECIMAL_PLACES),
+      endingSharePrice: details.endingSharePrice.toFixed(
+        OUTPUT_DECIMAL_PLACES,
+      ),
+      endingValue: details.endingValue.toFixed(OUTPUT_DECIMAL_PLACES),
+      netYield: details.netYield.toFixed(OUTPUT_DECIMAL_PLACES),
     });
   }
 }

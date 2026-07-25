@@ -1,14 +1,22 @@
 import React from "react";
 import { Activity, LineChart } from "../components/icons";
+import { useTranslation } from "../i18n";
 import ApiStatusBanner from "../components/ApiStatusBanner";
 import PageHeader from "../components/PageHeader";
 import { useVault } from "../context/VaultContext";
 import Skeleton from "../components/Skeleton";
 import EmptyState from "../components/ui/EmptyState";
+import APYTrendChart from "../components/APYTrendChart";
 import { useNavigate } from "react-router-dom";
+import RefreshControl from "../components/RefreshControl";
+import { usePolling } from "../hooks/usePolling";
+import { useStaleIndicator } from "../hooks/useStaleIndicator";
 
 const Analytics: React.FC = () => {
-    const { formattedTvl, tvl, summary, error, isLoading } = useVault();
+    const { formattedTvl, tvl, summary, error, isLoading, lastUpdate, refresh } = useVault();
+    const { t } = useTranslation();
+    const polling = usePolling(refresh, { interval: 30000, pauseOnHidden: true, pauseOnOffline: true });
+    const { isStale, ageText } = useStaleIndicator(lastUpdate);
     const navigate = useNavigate();
 
     /**
@@ -23,15 +31,15 @@ const Analytics: React.FC = () => {
             {error && <ApiStatusBanner error={error} />}
 
             <PageHeader
-                title={<span className="text-gradient">Project Analytics</span>}
-                description="Historical performance and pool health metrics."
+                title={<span className="text-gradient">{t("analytics.staticTitle")}</span>}
+                description={t("analytics.staticDescription")}
                 breadcrumbs={[
-                    { label: "Home", href: "/" },
-                    { label: "Analytics" },
+                    { label: t("analytics.homeLabel"), href: "/" },
+                    { label: t("nav.analytics") },
                 ]}
                 statusChips={[
                     {
-                        label: isLoading ? "Syncing" : "Live",
+                        label: isLoading ? t("analytics.syncingLabel") : t("analytics.liveLabel"),
                         variant: isLoading ? "warning" : "success",
                     },
                 ]}
@@ -39,6 +47,36 @@ const Analytics: React.FC = () => {
 
             {hasData ? (
                 <>
+                    {/* Per-widget refresh control + stale indicator for analytics stats */}
+                    <div style={{ marginBottom: "16px" }}>
+                        <RefreshControl
+                            isPolling={polling.isPolling}
+                            isPaused={polling.isPaused}
+                            pauseReason={polling.pauseReason}
+                            onPause={polling.pause}
+                            onResume={polling.resume}
+                            onRefresh={polling.forceRefresh}
+                            isRefetching={isLoading}
+                            lastUpdated={lastUpdate}
+                        />
+                        {isStale && ageText && (
+                            <div
+                                role="status"
+                                aria-live="polite"
+                                style={{
+                                    marginTop: "6px",
+                                    display: "flex",
+                                    alignItems: "center",
+                                    gap: "6px",
+                                    fontSize: "0.75rem",
+                                    color: "var(--text-warning, #f59e0b)",
+                                }}
+                            >
+                                <span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--text-warning, #f59e0b)", flexShrink: 0 }} />
+                                Data may be stale · {ageText}
+                            </div>
+                        )}
+                    </div>
                     <div className="flex gap-lg" style={{ flexWrap: 'wrap' }}>
                         <div className="glass-panel" style={{ flex: '1 1 300px', padding: '24px', background: 'var(--bg-muted)' }}>
                             <div className="text-body-sm" style={{ color: 'var(--text-secondary)', display: 'flex', justifyContent: 'space-between' }}>
@@ -69,20 +107,18 @@ const Analytics: React.FC = () => {
                         </div>
                     </div>
 
-                    <EmptyState
-                        variant="minimal"
-                        title="Advanced Analytics Coming Soon"
-                        description="We're currently indexing historical data to provide you with deeper insights into pool health and asset stability."
-                        icon={<Activity size={32} />}
-                    />
+                    <div style={{ marginTop: "32px" }}>
+                        <APYTrendChart />
+                    </div>
                 </>
             ) : (
                 /* Empty state: loading done, no TVL / no historical data */
                 <EmptyState
-                    title="No data to display."
-                    description="Performance metrics will appear here once your assets start generating yield."
+                    kind="no-data"
+                    title={t("analytics.emptyTitle")}
+                    description={t("analytics.emptyDesc")}
                     icon={<LineChart />}
-                    actionLabel="Deposit Now"
+                    actionLabel={t("txHistory.depositNow")}
                     onAction={() => navigate("/")}
                 />
             )}

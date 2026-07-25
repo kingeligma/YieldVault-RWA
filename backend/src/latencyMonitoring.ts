@@ -23,6 +23,8 @@ interface LatencyDataPoint {
 // Endpoint latency tracker
 class EndpointLatencyTracker {
   private dataPoints: LatencyDataPoint[] = [];
+  private cachedDataPoints: LatencyDataPoint[] = [];
+  private uncachedDataPoints: LatencyDataPoint[] = [];
   private lastAlertTime: number = 0;
 
   constructor(
@@ -33,12 +35,15 @@ class EndpointLatencyTracker {
     private alertCooldownMs: number
   ) {}
 
-  addLatencyMeasurement(latencyMs: number): void {
+  addLatencyMeasurement(latencyMs: number, cached?: boolean): void {
     const now = Date.now();
-    this.dataPoints.push({
-      timestamp: now,
-      latency: latencyMs,
-    });
+    const point: LatencyDataPoint = { timestamp: now, latency: latencyMs };
+    this.dataPoints.push(point);
+    if (cached === true) {
+      this.cachedDataPoints.push(point);
+    } else if (cached === false) {
+      this.uncachedDataPoints.push(point);
+    }
 
     // Prune stale data on every write
     this.pruneStaleData(now);
@@ -46,26 +51,34 @@ class EndpointLatencyTracker {
 
   /**
    * Remove data points that fall outside the rolling evaluation window.
-   * Must be called before any P95 calculation or SLO check so that
-   * stale measurements don't produce false positives/negatives.
    */
   pruneStaleData(nowMs: number = Date.now()): void {
     const cutoffTime = nowMs - this.evaluationWindowMs;
     this.dataPoints = this.dataPoints.filter(point => point.timestamp > cutoffTime);
+    this.cachedDataPoints = this.cachedDataPoints.filter(point => point.timestamp > cutoffTime);
+    this.uncachedDataPoints = this.uncachedDataPoints.filter(point => point.timestamp > cutoffTime);
+  }
+
+  private computeP95(points: LatencyDataPoint[]): number {
+    if (points.length === 0) return 0;
+    const sorted = points.map(p => p.latency).sort((a, b) => a - b);
+    const idx = Math.ceil(sorted.length * 0.95) - 1;
+    return sorted[idx] ?? 0;
   }
 
   calculateP95(): number {
-    // Always prune before calculating so stale data is excluded
     this.pruneStaleData();
+    return this.computeP95(this.dataPoints);
+  }
 
-    if (this.dataPoints.length === 0) return 0;
+  getCachedP95(): number | undefined {
+    this.pruneStaleData();
+    return this.cachedDataPoints.length > 0 ? this.computeP95(this.cachedDataPoints) : undefined;
+  }
 
-    const sortedLatencies = this.dataPoints
-      .map(point => point.latency)
-      .sort((a, b) => a - b);
-
-    const p95Index = Math.ceil(sortedLatencies.length * 0.95) - 1;
-    return sortedLatencies[p95Index] || 0;
+  getUncachedP95(): number | undefined {
+    this.pruneStaleData();
+    return this.uncachedDataPoints.length > 0 ? this.computeP95(this.uncachedDataPoints) : undefined;
   }
 
   isSLOBreached(): boolean {
@@ -76,13 +89,8 @@ class EndpointLatencyTracker {
   shouldAlert(): boolean {
     const now = Date.now();
     const cooldownExpired = now - this.lastAlertTime > this.alertCooldownMs;
-    // isSLOBreached() -> calculateP95() already prunes stale data
     const isBreaching = this.isSLOBreached();
-
-    // Alert if SLO is breached and cooldown has expired
-    // OR if this is the first time we detect a breach (no previous alert)
     const isFirstBreach = this.lastAlertTime === 0 && isBreaching;
-
     return isBreaching && (cooldownExpired || isFirstBreach);
   }
 
@@ -99,7 +107,6 @@ class EndpointLatencyTracker {
     return this.dataPoints.length;
   }
 
-  // Public getters for properties needed by the service
   get endpointType(): EndpointType {
     return this.type;
   }
@@ -144,6 +151,8 @@ export class LatencyMonitoringService {
       ['/health', EndpointType.READ],
       ['/ready', EndpointType.READ],
       ['/metrics', EndpointType.READ],
+      ['/admin/api-keys/audit-events', EndpointType.READ],
+      ['/admin/exports/jobs', EndpointType.READ],
       
       // Write endpoints (500ms SLO)
       ['/api/v1/vault/deposit', EndpointType.WRITE],
@@ -151,6 +160,9 @@ export class LatencyMonitoringService {
       ['/api/v1/vault/create', EndpointType.WRITE],
       ['/admin/cache/invalidate', EndpointType.WRITE],
       ['/admin/api-keys/register', EndpointType.WRITE],
+      ['/admin/api-keys/rotate', EndpointType.WRITE],
+      ['/admin/api-keys/revoke', EndpointType.WRITE],
+      ['/admin/exports/jobs/:id/verify', EndpointType.WRITE],
     ]);
 
     const sloConfig = this.getSLOConfig();
@@ -187,13 +199,13 @@ export class LatencyMonitoringService {
     }
   }
 
-  recordLatency(endpoint: string, latencyMs: number): void {
+  recordLatency(endpoint: string, latencyMs: number, cached?: boolean): void {
     // Normalize endpoint path (replace :id patterns)
     const normalizedEndpoint = this.normalizeEndpoint(endpoint);
     const tracker = this.trackers.get(normalizedEndpoint);
     
     if (tracker) {
-      tracker.addLatencyMeasurement(latencyMs);
+      tracker.addLatencyMeasurement(latencyMs, cached);
       
       // Check for immediate SLO breach after recording
       if (tracker.shouldAlert()) {
@@ -210,7 +222,7 @@ export class LatencyMonitoringService {
         sloConfig.evaluationWindowMs,
         sloConfig.alertCooldownMs
       );
-      newTracker.addLatencyMeasurement(latencyMs);
+      newTracker.addLatencyMeasurement(latencyMs, cached);
       this.trackers.set(normalizedEndpoint, newTracker);
       
       logger.log('info', 'Created new latency tracker for endpoint', {
@@ -226,7 +238,7 @@ export class LatencyMonitoringService {
     }
 
     // Convert dynamic paths like /api/v1/vault/123 to /api/v1/vault/:id
-    if (endpoint.match(/^\/api\/v1\/vault\/[^\/]+$/)) {
+    if (endpoint.match(/^\/api\/v1\/vault\/[^/]+$/)) {
       return '/api/v1/vault/:id';
     }
 
@@ -355,6 +367,8 @@ export class LatencyMonitoringService {
     isBreaching: boolean;
     dataPoints: number;
     lastAlertTime?: number;
+    cachedP95?: number;
+    uncachedP95?: number;
   }> {
     const metrics: Array<{
       endpoint: string;
@@ -364,6 +378,8 @@ export class LatencyMonitoringService {
       isBreaching: boolean;
       dataPoints: number;
       lastAlertTime?: number;
+      cachedP95?: number;
+      uncachedP95?: number;
     }> = [];
     
     this.trackers.forEach((tracker, endpoint) => {
@@ -375,6 +391,8 @@ export class LatencyMonitoringService {
         isBreaching: tracker.isSLOBreached(),
         dataPoints: tracker.getDataPointCount(),
         lastAlertTime: tracker.alertTime || undefined,
+        cachedP95: tracker.getCachedP95(),
+        uncachedP95: tracker.getUncachedP95(),
       });
     });
 

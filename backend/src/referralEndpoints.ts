@@ -1,8 +1,12 @@
 import { Router, Request, Response } from 'express';
 import { referralService } from './referralService';
 import { logger } from './middleware/structuredLogging';
+import { normalizeWalletAddress } from './walletUtils';
+import { cacheMiddleware } from './middleware/cache';
+import { sendUpstreamErrorResponse } from './middleware/upstreamErrorBoundary';
 
 const router = Router();
+const REFERRAL_CACHE_TTL_MS = parseInt(process.env.CACHE_LIST_ENDPOINTS_TTL_MS || '30000', 10);
 
 /**
  * @openapi
@@ -32,7 +36,7 @@ const router = Router();
  *       500:
  *         description: Internal server error
  */
-router.get('/:wallet', async (req: Request, res: Response) => {
+router.get('/:wallet', cacheMiddleware({ ttl: REFERRAL_CACHE_TTL_MS }), async (req: Request, res: Response) => {
   const { wallet } = req.params;
 
   if (!wallet) {
@@ -43,8 +47,10 @@ router.get('/:wallet', async (req: Request, res: Response) => {
     });
   }
 
+  const normalizedWallet = normalizeWalletAddress(wallet);
+
   try {
-    const stats = await referralService.getReferralStats(wallet);
+    const stats = await referralService.getReferralStats(normalizedWallet);
 
     if (!stats) {
       return res.status(404).json({
@@ -58,8 +64,11 @@ router.get('/:wallet', async (req: Request, res: Response) => {
   } catch (error) {
     logger.log('error', 'Error fetching referral stats', {
       error: error instanceof Error ? error.message : String(error),
-      wallet,
+      wallet: normalizedWallet,
     });
+    if (sendUpstreamErrorResponse(res, req, error, 'Failed to fetch referral stats')) {
+      return;
+    }
     return res.status(500).json({
       error: 'Internal Server Error',
       status: 500,
@@ -93,7 +102,7 @@ router.get('/:wallet', async (req: Request, res: Response) => {
  *       500:
  *         description: Internal server error
  */
-router.get('/code/:wallet', async (req: Request, res: Response) => {
+router.get('/code/:wallet', cacheMiddleware({ ttl: REFERRAL_CACHE_TTL_MS }), async (req: Request, res: Response) => {
   const { wallet } = req.params;
 
   if (!wallet) {
@@ -104,14 +113,19 @@ router.get('/code/:wallet', async (req: Request, res: Response) => {
     });
   }
 
+  const normalizedWallet = normalizeWalletAddress(wallet);
+
   try {
-    const code = await referralService.getOrCreateReferralCode(wallet);
+    const code = await referralService.getOrCreateReferralCode(normalizedWallet);
     return res.status(200).json({ code });
   } catch (error) {
     logger.log('error', 'Error getting referral code', {
       error: error instanceof Error ? error.message : String(error),
-      wallet,
+      wallet: normalizedWallet,
     });
+    if (sendUpstreamErrorResponse(res, req, error, 'Failed to get referral code')) {
+      return;
+    }
     return res.status(500).json({
       error: 'Internal Server Error',
       status: 500,

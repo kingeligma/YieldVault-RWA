@@ -4,20 +4,20 @@ import ApiStatusBanner from "../components/ApiStatusBanner";
 import Badge from "../components/Badge";
 import { DataTable, type DataTableColumn } from "../components/DataTable";
 import PageHeader from "../components/PageHeader";
+import { SkeletonText } from "../components/Skeleton";
 import TransactionFilterPanel from "../components/TransactionFilterPanel";
+import TransactionTimeline from "../components/TransactionTimeline";
 import EmptyState from "../components/ui/EmptyState";
-import { Activity, Loader2 } from "../components/icons";
+import { Activity, Loader2, Wallet } from "../components/icons";
+import { useTransactionTimeline } from "../hooks/useTransactionTimeline";
 import {
   normalizeApiError,
   isValidationError,
-  type ApiError,
-  type ValidationError,
 } from "../lib/api";
 import {
   formatAmount,
   formatTimestamp,
   truncateHash,
-  getTransactions,
   type Transaction,
 } from "../lib/transactionApi";
 import { useClientDataTable } from "../hooks/useClientDataTable";
@@ -28,11 +28,12 @@ import { useTransactionHistory } from "../hooks/useTransactionData";
 import { getStellarExplorerUrl } from "../lib/security";
 import { networkConfig } from "../config/network";
 
+import { useDelayedLoading } from "../hooks/useDelayedLoading";
+
 interface TransactionHistoryProps {
   walletAddress: string | null;
 }
 
-type TxTypeFilter = "all" | "deposit" | "withdrawal";
 type ViewMode = "paginated" | "infinite";
 const DEFAULT_PAGE_SIZE = 10;
 const INFINITE_SCROLL_BATCH_SIZE = 20;
@@ -92,75 +93,144 @@ const STATUS_COLOR_MAP: Record<Transaction["status"], "success" | "warning" | "e
   failed: "error",
 };
 
-const columns: DataTableColumn<Transaction>[] = [
-  {
-    id: "type",
-    header: "Type",
-    sortable: true,
-    cell: (row) => (
-      <Badge variant="status" color={row.type === "deposit" ? "cyan" : "error"}>
-        {row.type}
-      </Badge>
-    ),
-  },
-  {
-    id: "status",
-    header: "Status",
-    sortable: true,
-    cell: (row) => (
-      <Badge 
-        variant="status" 
-        color={STATUS_COLOR_MAP[row.status]}
-        icon={row.status === "pending" ? <Loader2 size={12} className="animate-spin" /> : undefined}
-      >
-        {row.status}
-      </Badge>
-    ),
-  },
-  {
-    id: "amount",
-    header: "Amount",
-    sortable: true,
-    cell: (row) => <span>{formatAmount(row.amount, row.asset)}</span>,
-  },
-  {
-    id: "asset",
-    header: "Asset",
-    sortable: false,
-    cell: (row) => <span>{row.asset ?? "—"}</span>,
-  },
-  {
-    id: "date",
-    header: "Date",
-    sortable: true,
-    cell: (row) => <span>{formatTimestamp(row.timestamp)}</span>,
-  },
-  {
-    id: "hash",
-    header: "Transaction Hash",
-    sortable: false,
-    cell: (row) => (
-      <a
-        href={getStellarExplorerUrl(
-          row.transactionHash,
-          networkConfig.isTestnet ? "testnet" : "mainnet",
-        )}
-        target="_blank"
-        rel="noopener noreferrer"
-        style={{ color: "var(--accent-cyan)", textDecoration: "none" }}
-        title={row.transactionHash}
-      >
-        {truncateHash(row.transactionHash)}
-      </a>
-    ),
-  },
-];
+/** Inline panel shown below a pending transaction row to track its live state. */
+const PendingTimelinePanel: React.FC<{ txHash: string; onDismiss: () => void }> = ({
+  txHash,
+  onDismiss,
+}) => {
+  const { status, elapsedSeconds, errorMessage } = useTransactionTimeline({ txHash });
+  const { t } = useTranslation();
+
+  return (
+    <div
+      className="glass-panel"
+      style={{
+        padding: "16px 20px",
+        margin: "8px 0",
+        border: "1px solid var(--border-glass-glow)",
+        borderRadius: "var(--radius-md)",
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "12px" }}>
+        <span style={{ fontSize: "var(--text-sm)", fontWeight: 600, color: "var(--text-secondary)" }}>
+          {t("txHistory.liveStatus")}
+        </span>
+        <button
+          type="button"
+          onClick={onDismiss}
+          aria-label={t("txHistory.dismissTimeline")}
+          style={{
+            background: "none",
+            border: "none",
+            cursor: "pointer",
+            color: "var(--text-tertiary)",
+            fontSize: "var(--text-sm)",
+            padding: "2px 6px",
+          }}
+        >
+          ✕
+        </button>
+      </div>
+      <TransactionTimeline
+        status={status}
+        txHash={txHash}
+        elapsedSeconds={elapsedSeconds}
+        errorMessage={errorMessage}
+      />
+    </div>
+  );
+};
 
 const TransactionHistory: React.FC<TransactionHistoryProps> = ({
   walletAddress,
 }) => {
   const { data: queryTransactions, isLoading, error: queryError } = useTransactionHistory(walletAddress);
-  const transactions = queryTransactions ?? [];
+  const delayedLoading = useDelayedLoading(isLoading);
+  const transactions = React.useMemo(
+    () => queryTransactions ?? [],
+    [queryTransactions],
+  );
+
+  const [selectedPendingHash, setSelectedPendingHash] = useState<string | null>(null);
+
+  const columns: DataTableColumn<Transaction>[] = React.useMemo(() => [
+    {
+      id: "type",
+      header: t("txHistory.typeHeader"),
+      sortable: true,
+      cell: (row) => (
+        <Badge variant="status" color={row.type === "deposit" ? "cyan" : "error"}>
+          {row.type}
+        </Badge>
+      ),
+    },
+    {
+      id: "status",
+      header: t("txHistory.statusHeader"),
+      sortable: true,
+      cell: (row) => (
+        <button
+          type="button"
+          onClick={row.status === "pending" ? () => setSelectedPendingHash(
+            selectedPendingHash === row.transactionHash ? null : row.transactionHash
+          ) : undefined}
+          style={{
+            background: "none",
+            border: "none",
+            padding: 0,
+            cursor: row.status === "pending" ? "pointer" : "default",
+          }}
+          title={row.status === "pending" ? t("txHistory.clickToTrack") : undefined}
+          aria-expanded={row.status === "pending" ? selectedPendingHash === row.transactionHash : undefined}
+        >
+          <Badge
+            variant="status"
+            color={STATUS_COLOR_MAP[row.status]}
+            icon={row.status === "pending" ? <Loader2 size={12} className="animate-spin" /> : undefined}
+          >
+            {row.status}
+          </Badge>
+        </button>
+      ),
+    },
+    {
+      id: "amount",
+      header: t("txHistory.amountHeader"),
+      sortable: true,
+      cell: (row) => <span>{formatAmount(row.amount, row.asset)}</span>,
+    },
+    {
+      id: "asset",
+      header: t("txHistory.assetHeader"),
+      sortable: false,
+      cell: (row) => <span>{row.asset ?? "—"}</span>,
+    },
+    {
+      id: "date",
+      header: t("txHistory.dateHeader"),
+      sortable: true,
+      cell: (row) => <span>{formatTimestamp(row.timestamp)}</span>,
+    },
+    {
+      id: "hash",
+      header: t("txHistory.hashHeader"),
+      sortable: false,
+      cell: (row) => (
+        <a
+          href={getStellarExplorerUrl(
+            row.transactionHash,
+            networkConfig.isTestnet ? "testnet" : "mainnet",
+          )}
+          target="_blank"
+          rel="noopener noreferrer"
+          style={{ color: "var(--accent-cyan)", textDecoration: "none" }}
+          title={row.transactionHash}
+        >
+          {truncateHash(row.transactionHash)}
+        </a>
+      ),
+    },
+  ], [selectedPendingHash]);
 
   const error = queryError 
     ? (isValidationError(queryError) ? queryError : normalizeApiError(queryError)) 
@@ -200,6 +270,7 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
     setAmountMin,
     setAmountMax,
     clearAll,
+    setAsset,
   } = useTransactionFilters();
 
   // Keep useDataTableState's search in sync with the filter panel's search
@@ -278,6 +349,15 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
     },
   );
 
+  // Available assets for the asset filter (unique, non-empty)
+  const assetOptions = React.useMemo(() => {
+    const set = new Set<string>();
+    for (const t of transactions) {
+      if (t.asset) set.add(t.asset);
+    }
+    return Array.from(set).sort();
+  }, [transactions]);
+
   // Infinite scroll: compute visible rows from sorted/filtered set
   const infiniteScrollRows = React.useMemo(() => {
     return sortedRows.slice(0, visibleCount);
@@ -291,7 +371,14 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
   // Reset visible count when filters/search/sort change
   useEffect(() => {
     setVisibleCount(INFINITE_SCROLL_BATCH_SIZE);
-  }, [state.search, state.sortBy, state.sortDirection, txType, dateFrom, dateTo]);
+  }, [
+    state.search,
+    state.sortBy,
+    state.sortDirection,
+    filters.types,
+    filters.dateFrom,
+    filters.dateTo,
+  ]);
 
   // Handle loading more items for infinite scroll
   const handleLoadMore = useCallback(() => {
@@ -372,17 +459,19 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
   // ── Empty state ─────────────────────────────────────────────────────────
   const emptyMessage = (
     <EmptyState
-      variant="minimal"
+      kind={hasActiveFilters ? "search" : "no-data"}
       title={hasActiveFilters ? "No transactions found" : "No transactions yet"}
       description={
         hasActiveFilters
-          ? "No transactions match your current filters."
-          : "Once you make a deposit or withdrawal, it will appear here."
+          ? t("txHistory.noResults.desc")
+          : t("txHistory.noTransactions.desc")
       }
       icon={<Activity size={24} />}
-      {...(hasActiveFilters
-        ? { actionLabel: "Reset filters", onAction: clearAll }
-        : {})}
+      action={
+        hasActiveFilters
+          ? { label: "Reset filters", onClick: clearAll, variant: "secondary" }
+          : { label: "Deposit Now", href: "/" }
+      }
     />
   );
 
@@ -394,11 +483,12 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
       <PageHeader
         title={
           <>
-            Transaction <span className="text-gradient">History</span>
+            {t("txHistory.pageTitle").replace("Transaction ", "Transaction ")}{" "}
+            <span className="text-gradient">History</span>
           </>
         }
-        description="View all your past deposits and withdrawals."
-        breadcrumbs={[{ label: "Home", href: "/" }, { label: "Transactions" }]}
+        description={t("txHistory.pageDesc")}
+        breadcrumbs={[{ label: "Home", href: "/" }, { label: t("txHistory.pageTitle") }]}
         statusChips={
           walletAddress
             ? [
@@ -407,7 +497,7 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
                   variant: "cyan",
                 },
                 {
-                  label: isLoading ? "Loading..." : "Up to date",
+                  label: isLoading ? t("txHistory.loadingLabel") : t("txHistory.upToDateLabel"),
                   variant: isLoading ? "warning" : "success",
                 },
               ]
@@ -416,11 +506,13 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
       />
 
       {!walletAddress ? (
-        <div style={{ textAlign: "center", padding: "48px" }}>
-          <p style={{ color: "var(--text-secondary)" }}>
-            Please connect your wallet to view your transaction history.
-          </p>
-        </div>
+        <EmptyState
+          kind="permission"
+          title="Connect your wallet"
+          description="Connect your wallet to view your transaction history."
+          icon={<Wallet />}
+          action={{ label: "Go to dashboard", href: "/" }}
+        />
       ) : (
         <div className="flex flex-col gap-lg">
           {error && <ApiStatusBanner error={error} />}
@@ -431,6 +523,8 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
             onSearchChange={setFilterSearch}
             onTypesChange={setTypes}
             onStatusesChange={setStatuses}
+            assets={assetOptions}
+            onAssetChange={setAsset}
             onDateFromChange={setDateFrom}
             onDateToChange={setDateTo}
             onAmountMinChange={setAmountMin}
@@ -533,24 +627,14 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
               className="text-body-sm"
               style={{ color: "var(--text-secondary)", marginBottom: "16px" }}
             >
-              {isLoading
-                ? "Loading transactions..."
+              {delayedLoading
+                ? <SkeletonText width="180px" />
                 : viewMode === "infinite"
                   ? `Showing ${infiniteScrollRows.length} of ${sortedRows.length} transactions`
                   : `${totalItems} transactions found`}
             </div>
 
-            {isLoading ? (
-              <div
-                style={{
-                  textAlign: "center",
-                  padding: "48px",
-                  color: "var(--text-secondary)",
-                }}
-              >
-                Loading transactions...
-              </div>
-            ) : viewMode === "infinite" ? (
+            {viewMode === "infinite" ? (
               /* Infinite Scroll View */
               <div className="infinite-scroll-container">
                 <DataTable
@@ -559,7 +643,7 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
                   rows={displayRows}
                   rowKey={(row) => row.id}
                   emptyMessage={emptyMessage}
-                  isLoading={isLoading}
+                  isLoading={delayedLoading}
                   skeletonRows={state.pageSize}
                   sortBy={state.sortBy}
                   sortDirection={state.sortDirection}
@@ -616,7 +700,7 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
                 rows={displayRows}
                 rowKey={(row) => row.id}
                 emptyMessage={emptyMessage}
-                isLoading={isLoading}
+                isLoading={delayedLoading}
                 skeletonRows={state.pageSize}
                 sortBy={state.sortBy}
                 sortDirection={state.sortDirection}
@@ -628,6 +712,14 @@ const TransactionHistory: React.FC<TransactionHistoryProps> = ({
                   totalPages,
                 }}
                 onPageChange={setPage}
+              />
+            )}
+
+            {/* Live timeline for selected pending transaction */}
+            {selectedPendingHash && (
+              <PendingTimelinePanel
+                txHash={selectedPendingHash}
+                onDismiss={() => setSelectedPendingHash(null)}
               />
             )}
           </section>
