@@ -62,6 +62,10 @@ jobs:
         working-directory: ./backend
         run: npm run lint
 
+      - name: Run TypeScript type-check and build
+        working-directory: ./stellar-market/backend
+        run: npm ci && npm run build
+
       - name: Run migrations
         working-directory: ./backend
         env:
@@ -140,6 +144,11 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
+          components: rustfmt
+
+      - name: Enforce cargo fmt
+        working-directory: ./contracts/soroban
+        run: cargo fmt --all --check
 
       - name: Run cargo test
         working-directory: ./contracts/soroban
