@@ -62,6 +62,10 @@ jobs:
         working-directory: ./backend
         run: npm run lint
 
+      - name: Run TypeScript type-check and build
+        working-directory: ./stellar-market/backend
+        run: npm ci && npm run build
+
       - name: Run migrations
         working-directory: ./backend
         env:
